@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/cloudfoundry-incubator/consuladapter"
+	"github.com/hashicorp/consul/api"
 	"github.com/nu7hatch/gouuid"
 	"github.com/pivotal-golang/clock"
 	"github.com/pivotal-golang/lager"
@@ -76,6 +77,7 @@ func (p Presence) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
 
 	var retryTimer <-chan time.Time
 	var presenceLost <-chan string
+	var lastConsulErr error
 
 	go setPresence(p.consul)
 
@@ -89,14 +91,13 @@ func (p Presence) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
 			logger.Info("shutting-down", lager.Data{"received-signal": sig})
 
 			return nil
-		case err := <-p.consul.Err():
+		case lastConsulErr = <-p.consul.Err():
 			var data lager.Data
-			if err != nil {
-				data = lager.Data{"err": err.Error()}
+			if lastConsulErr != nil {
+				data = lager.Data{"err": lastConsulErr.Error()}
 			}
 			logger.Info("consul-error", data)
 
-			presenceLost = nil
 			retryTimer = p.clock.NewTimer(p.retryInterval).C()
 		case result := <-presenceCh:
 			if result.err == nil {
@@ -119,21 +120,20 @@ func (p Presence) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
 			presenceLost = nil
 			retryTimer = p.clock.NewTimer(p.retryInterval).C()
 		case <-retryTimer:
-			logger.Info("recreating-session")
-
-			presenceLost = nil
-			newSession, err := p.consul.Recreate()
-			if err != nil {
-				logger.Error("failed-recreating-session", err)
-
-				retryTimer = p.clock.NewTimer(p.retryInterval).C()
-			} else {
-				logger.Info("succeeded-recreating-session")
-
-				p.consul = newSession
-				retryTimer = nil
-				go setPresence(newSession)
+			if lastConsulErr == api.ErrSessionExpired || lastConsulErr == ErrInvalidSession {
+				logger.Info("recreating-session")
+				newSession, err := p.consul.Recreate()
+				if err != nil {
+					logger.Error("failed-recreating-session", err)
+					retryTimer = p.clock.NewTimer(p.retryInterval).C()
+					continue
+				} else {
+					logger.Info("succeeded-recreating-session")
+					p.consul = newSession
+					retryTimer = nil
+				}
 			}
+			go setPresence(p.consul)
 		}
 	}
 }
